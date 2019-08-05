@@ -1,12 +1,15 @@
 package npc
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/pkg/errors"
 	coreapi "k8s.io/api/core/v1"
 	extnapi "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/weaveworks/weave/common"
 	"github.com/weaveworks/weave/net/ipset"
@@ -32,32 +35,53 @@ type controller struct {
 
 	nodeName string // my node name
 
-	ipt iptables.Interface
-	ips ipset.Interface
-
-	nss         map[string]*ns // ns name -> ns struct
-	nsSelectors *selectorSet   // selector string -> nsSelector
+	ipt                    iptables.Interface
+	ips                    ipset.Interface
+	clientset              kubernetes.Interface
+	nss                    map[string]*ns // ns name -> ns struct
+	nsSelectors            *selectorSet   // selector string -> nsSelector
+	namespacedPodSelectors *selectorSet
+	defaultEgressDrop      bool // flag to track if base iptable rule to drop egress traffic is added or not
 }
 
-func New(nodeName string, ipt iptables.Interface, ips ipset.Interface) NetworkPolicyController {
+func New(nodeName string, ipt iptables.Interface, ips ipset.Interface, clientset kubernetes.Interface) NetworkPolicyController {
 	c := &controller{
-		nodeName: nodeName,
-		ipt:      ipt,
-		ips:      ips,
-		nss:      make(map[string]*ns)}
+		nodeName:  nodeName,
+		ipt:       ipt,
+		ips:       ips,
+		clientset: clientset,
+		nss:       make(map[string]*ns)}
 
 	doNothing := func(*selector, policyType) error { return nil }
 	c.nsSelectors = newSelectorSet(ips, c.onNewNsSelector, doNothing, doNothing)
-
+	c.namespacedPodSelectors = newSelectorSet(ips, c.onNewNamespacePodsSelector, doNothing, doNothing)
 	return c
 }
 
 func (npc *controller) onNewNsSelector(selector *selector) error {
 	for _, ns := range npc.nss {
 		if ns.namespace != nil {
-			if selector.matches(ns.namespace.ObjectMeta.Labels) {
+			if selector.matchesNamespaceSelector(ns.namespace.ObjectMeta.Labels) {
 				if err := selector.addEntry(ns.namespace.ObjectMeta.UID, string(ns.allPods.ipsetName), namespaceComment(ns)); err != nil {
 					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (npc *controller) onNewNamespacePodsSelector(selector *selector) error {
+	for _, ns := range npc.nss {
+		if ns.namespace != nil && len(ns.pods) > 0 {
+			for _, pod := range ns.pods {
+				if hasIP(pod) {
+					if selector.matchesNamespacedPodSelector(pod.ObjectMeta.Labels, ns.namespace.ObjectMeta.Labels) {
+						if err := selector.addEntry(pod.ObjectMeta.UID, pod.Status.PodIP, podComment(pod)); err != nil {
+							return err
+						}
+
+					}
 				}
 			}
 		}
@@ -68,7 +92,11 @@ func (npc *controller) onNewNsSelector(selector *selector) error {
 func (npc *controller) withNS(name string, f func(ns *ns) error) error {
 	ns, found := npc.nss[name]
 	if !found {
-		newNs, err := newNS(name, npc.nodeName, npc.ipt, npc.ips, npc.nsSelectors)
+		namespace, err := npc.clientset.CoreV1().Namespaces().Get(name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		newNs, err := newNS(name, npc.nodeName, npc.ipt, npc.ips, npc.nsSelectors, npc.namespacedPodSelectors, namespace)
 		if err != nil {
 			return err
 		}
@@ -121,11 +149,26 @@ func (npc *controller) AddNetworkPolicy(obj interface{}) error {
 	npc.Lock()
 	defer npc.Unlock()
 
+	// lazily add default rule to drop egress traffic only when network policies are applied
+	if !npc.defaultEgressDrop {
+		egressNetworkPolicy, err := isEgressNetworkPolicy(obj)
+		if err != nil {
+			return err
+		}
+		if egressNetworkPolicy {
+			npc.defaultEgressDrop = true
+			if err := npc.ipt.Append(TableFilter, EgressChain,
+				"-m", "mark", "!", "--mark", EgressMark, "-j", "DROP"); err != nil {
+				npc.defaultEgressDrop = false
+				return fmt.Errorf("Failed to add iptable rule to drop egress traffic from the pods by default due to %s", err.Error())
+			}
+		}
+	}
+
 	nsName, err := nsName(obj)
 	if err != nil {
 		return err
 	}
-
 	common.Log.Infof("EVENT AddNetworkPolicy %s", js(obj))
 	return npc.withNS(nsName, func(ns *ns) error {
 		return errors.Wrap(ns.addNetworkPolicy(obj), "add network policy")
@@ -201,4 +244,21 @@ func nsName(obj interface{}) (string, error) {
 	}
 
 	return "", errInvalidNetworkPolicyObjType
+}
+
+func isEgressNetworkPolicy(obj interface{}) (bool, error) {
+	if policy, ok := obj.(*networkingv1.NetworkPolicy); ok {
+		if len(policy.Spec.PolicyTypes) > 0 {
+			for _, policyType := range policy.Spec.PolicyTypes {
+				if policyType == networkingv1.PolicyTypeEgress {
+					return true, nil
+				}
+			}
+		}
+		if policy.Spec.Egress != nil {
+			return true, nil
+		}
+		return false, nil
+	}
+	return false, errInvalidNetworkPolicyObjType
 }
